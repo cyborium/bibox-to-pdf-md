@@ -13,7 +13,7 @@ into a searchable PDF.
 
 Usage: bibox [--output <dir>] [--no-text] [--debug-text]
              [--save-images] [--no-materials] [--book <id>]
-             [--markdown] [--force]
+             [--markdown] [--force] [--half-res]
 """
 
 import sys
@@ -73,25 +73,99 @@ def decode_varint_zigzag(buf: bytes, pos: int) -> int:
     return (result >> 1) ^ -(result & 1)
 
 
-# -- Extract page mapping from Chrome IndexedDB blob --
-def extract_page_mapping(blob_path: Path) -> list[dict]:
+# -- Extract page mapping from LDB hashesA array (primary) --
+def _extract_page_mapping_ldb(ldb_dir: Path, book_id: int) -> list[dict]:
+    # Zigzag-encode book_id to varint bytes for marker search
+    zz = book_id * 2
+    varint = bytearray()
+    while zz > 0x7F:
+        varint.append((zz & 0x7F) | 0x80)
+        zz >>= 7
+    varint.append(zz)
+    book_marker = b"bookIdI" + bytes(varint)
+
+    md5_re = re.compile(rb"[0-9a-f]{32}")
+    best: list[str] = []
+
+    for ldb_file in sorted(ldb_dir.glob("*.ldb")) + sorted(ldb_dir.glob("*.log")):
+        try:
+            data = ldb_file.read_bytes()
+        except Exception:
+            continue
+        idx = 0
+        while True:
+            pos = data.find(b"hashesA", idx)
+            if pos == -1:
+                break
+            idx = pos + 1
+            # Verify correct book_id appears within 300 bytes before
+            if book_marker not in data[max(0, pos - 300):pos]:
+                continue
+            # Find first MD5 hash within 40 bytes after marker (4-byte preamble + 32-byte hash)
+            after = pos + len("hashesA")
+            m = md5_re.search(data, after, after + 40)
+            if not m:
+                continue
+            # Greedily collect consecutive hashes (allow ≤10-byte gaps to bridge WAL block headers)
+            hashes: list[str] = []
+            cur = m.start()
+            while cur + 32 <= len(data):
+                chunk = data[cur:cur + 32]
+                if md5_re.fullmatch(chunk):
+                    hashes.append(chunk.decode("ascii"))
+                    cur += 32
+                else:
+                    skipped = False
+                    for skip in range(1, 11):
+                        nxt = data[cur + skip:cur + skip + 32]
+                        if len(nxt) == 32 and md5_re.fullmatch(nxt):
+                            hashes.append(nxt.decode("ascii"))
+                            cur += skip + 32
+                            skipped = True
+                            break
+                    if not skipped:
+                        break
+            if len(hashes) > len(best):
+                best = hashes
+
+    return [{"page": i + 1, "hash": h} for i, h in enumerate(best)]
+
+
+# -- Extract page mapping from Chrome IndexedDB blob (fallback) --
+def _extract_page_mapping_blob(blob_path: Path) -> list[dict]:
     buf = blob_path.read_bytes()
     text = buf.decode("latin-1")
 
     url_re = re.compile(
         r"https://static\.bibox2\.westermann\.de/bookpages/[A-Za-z0-9+/=]+/(\d+)\.png"
     )
+    # Fallback for fragmented entries where only the URL tail is readable
+    tail_re = re.compile(r"/(\d{1,4})\.png")
     md5_re = re.compile(r"[0-9a-f]{32}")
 
-    urls = [(m.start(), m.end(), int(m.group(1))) for m in url_re.finditer(text)]
     hashes = [(m.start(), m.group(0)) for m in md5_re.finditer(text)]
 
-    pairs = []
-    for u_start, u_end, page in urls:
+    def find_nearest_hash(u_end: int) -> str | None:
         for h_pos, h_val in hashes:
             if u_end < h_pos < u_end + 400:
-                pairs.append({"page": page, "hash": h_val, "pos": u_start})
-                break
+                return h_val
+        return None
+
+    pairs = []
+    url_ends: set[int] = set()
+
+    for m in url_re.finditer(text):
+        h = find_nearest_hash(m.end())
+        if h:
+            pairs.append({"page": int(m.group(1)), "hash": h, "pos": m.start()})
+            url_ends.add(m.end())
+
+    for m in tail_re.finditer(text):
+        if m.end() in url_ends:
+            continue
+        h = find_nearest_hash(m.end())
+        if h:
+            pairs.append({"page": int(m.group(1)), "hash": h, "pos": m.start()})
 
     by_page: dict[int, list] = {}
     for p in pairs:
@@ -100,25 +174,97 @@ def extract_page_mapping(blob_path: Path) -> list[dict]:
     if not by_page:
         return []
 
-    max_page = max(by_page.keys())
     pages = []
-    for i in range(1, max_page + 1):
-        entries = by_page.get(i)
-        if not entries:
-            continue
-        entries.sort(key=lambda e: e["pos"])
-        pages.append({"page": i, "hash": entries[1]["hash"] if len(entries) >= 2 else entries[0]["hash"]})
+    for page in sorted(by_page.keys()):
+        entries = sorted(by_page[page], key=lambda e: e["pos"])
+        h = entries[1]["hash"] if len(entries) >= 2 else entries[0]["hash"]
+        pages.append({"page": page, "hash": h})
 
     return pages
 
 
+def _pixel_dims(data: bytes, ext: str) -> tuple[int, int]:
+    """Return (width, height) in pixels from image header."""
+    if ext == "png" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if ext == "jpg":
+        i = 2
+        while i + 4 <= len(data):
+            seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if data[i] == 0xFF and data[i + 1] in (0xC0, 0xC1, 0xC2):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + seg_len
+    return 0, 0
+
+
+def _image_dpi(data: bytes, ext: str) -> float:
+    """Return DPI from PNG pHYs chunk or JPEG JFIF APP0, 0 if not found."""
+    if ext == "png":
+        pos = 8
+        while pos + 12 <= len(data):
+            length = struct.unpack(">I", data[pos:pos + 4])[0]
+            chunk = data[pos + 4:pos + 8]
+            if chunk == b"pHYs" and pos + 8 + length <= len(data):
+                px = struct.unpack(">I", data[pos + 8:pos + 12])[0]
+                unit = data[pos + 16]
+                return (px / 39.3701) if unit == 1 and px > 0 else 0.0
+            if chunk == b"IDAT":
+                break
+            pos += 12 + length
+    elif ext == "jpg":
+        i = 2
+        while i + 4 <= len(data):
+            seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if data[i:i + 2] == b"\xff\xe0" and data[i + 4:i + 9] == b"JFIF\x00":
+                units = data[i + 11]
+                xdpi = struct.unpack(">H", data[i + 12:i + 14])[0]
+                if units == 1 and xdpi > 0:
+                    return float(xdpi)
+                if units == 2 and xdpi > 0:
+                    return xdpi * 2.54
+                break
+            i += 2 + seg_len
+    return 0.0
+
+
+def extract_page_mapping(blob_path: Path, ldb_dir: Path | None = None, book_id: int | None = None) -> list[dict]:
+    if ldb_dir and book_id:
+        pages = _extract_page_mapping_ldb(ldb_dir, book_id)
+        if pages:
+            return pages
+    return _extract_page_mapping_blob(blob_path)
+
+
 # -- Extract book titles from LevelDB --
 TITLE_MARKER = b'\x22\x05\x74\x69\x74\x6c\x65\x22'  # "\x05title"
-ID_MARKER = b'\x22\x02\x69\x64\x49'                   # "\x02idI"
+ID_MARKER = b'\x22\x02\x69\x64\x49'                   # "\x02idI" (old format)
+BOOK_ID_MARKER = b'bookIdI'                            # new format
 
 
-def extract_book_titles(ldb_dir: Path) -> dict[int, str]:
+def extract_book_titles(ldb_dir: Path, books_dir: Path | None = None) -> dict[int, str]:
+    import json
     titles = {}
+
+    # Seed from titles.json cache — survives both LDB compaction and folder deletion
+    titles_cache = (books_dir / "titles.json") if books_dir else None
+    if titles_cache and titles_cache.exists():
+        try:
+            for k, v in json.loads(titles_cache.read_text(encoding="utf-8")).items():
+                titles[int(k)] = v
+        except Exception:
+            pass
+
+    # Seed from existing output folder names — survives LDB compaction
+    if books_dir and books_dir.exists():
+        for d in books_dir.iterdir():
+            if not d.is_dir():
+                continue
+            m = re.match(r"^(.+?)\s+\((\d+)\)$", d.name)
+            if m:
+                t, bid = m.group(1).strip(), int(m.group(2))
+                if bid > 0 and len(t) > 2 and len(t) > len(titles.get(bid, "")):
+                    titles[bid] = t
 
     for f in ldb_dir.iterdir():
         if f.suffix not in (".ldb", ".log"):
@@ -133,28 +279,34 @@ def extract_book_titles(ldb_dir: Path) -> dict[int, str]:
 
             title_start = idx + len(TITLE_MARKER)
             title_len, str_start = read_varint(buf, title_start)
-            if title_len <= 0 or title_len > 200 or str_start + title_len > len(buf):
+            if title_len <= 0 or title_len > 300 or str_start + title_len > len(buf):
                 idx += 8
                 continue
 
-            title = buf[str_start: str_start + title_len].decode("utf-8", errors="replace")
+            # Decode as Latin-1; title may have binary junk mid-way, stop at first control char
+            raw = buf[str_start: str_start + title_len]
+            title = re.split(rb'[\x00-\x1f]', raw)[0].decode("latin-1").strip()
 
-            # Confirm book record: pagenumI must follow
             after = buf[str_start + title_len: str_start + title_len + 200]
-            if b"pagenumI" not in after:
-                idx += 8
-                continue
-
-            # Search backwards for idI
             before = buf[max(0, idx - 200): idx]
-            id_pos = before.rfind(ID_MARKER)
-            if id_pos == -1:
-                idx += 8
-                continue
 
-            book_id = decode_varint_zigzag(before, id_pos + len(ID_MARKER))
-            if book_id > 0 and len(title) > 1:
-                titles.setdefault(book_id, title)
+            book_id = None
+            # Old format: pagenumI after title + "\x02idI" before
+            if b"pagenumI" in after:
+                id_pos = before.rfind(ID_MARKER)
+                if id_pos != -1:
+                    book_id = decode_varint_zigzag(before, id_pos + len(ID_MARKER))
+            # New format: bookIdI may straddle the title blob boundary — search overlapping window
+            if not book_id:
+                overlap_start = max(0, str_start + title_len - len(BOOK_ID_MARKER))
+                overlap = buf[overlap_start: overlap_start + len(BOOK_ID_MARKER) + 200]
+                bid_pos = overlap.find(BOOK_ID_MARKER)
+                if bid_pos != -1:
+                    book_id = decode_varint_zigzag(buf, overlap_start + bid_pos + len(BOOK_ID_MARKER))
+
+            if book_id and book_id > 0 and len(title) > 1:
+                if len(title) > len(titles.get(book_id, "")):
+                    titles[book_id] = title
 
             idx = str_start + title_len
 
@@ -202,6 +354,21 @@ def find_all_page_data(sync_dir: Path, ldb_dir: Path) -> list[dict]:
         for m in hash_re.finditer(buf):
             candidates.add(m.group(1).decode("ascii"))
 
+    # Newer BiBox versions reference pageData via |hash= format in blobs rather than
+    # pageDataHash in LDB. Scan sync_dir directly for JSON files as fallback.
+    _ks0 = decrypt(b"\x00" * 16)[0]  # keystream byte 0 (same for every file)
+    json_enc = _ks0 ^ 0x7B           # encrypted '{' character
+    for f in sync_dir.rglob("*"):
+        if not f.is_file() or f.name in candidates:
+            continue
+        try:
+            with open(f, "rb") as fp:
+                first = fp.read(1)
+            if first and first[0] == json_enc:
+                candidates.add(f.name)
+        except Exception:
+            pass
+
     results = []
     for h in candidates:
         file_path = hash_to_file_path(sync_dir, h)
@@ -225,51 +392,123 @@ def find_all_page_data(sync_dir: Path, ldb_dir: Path) -> list[dict]:
 
 # -- Extract supplemental material references from blob --
 def extract_materials(blob_buf: bytes) -> list[dict]:
-    title_key = b'\x22\x05\x74\x69\x74\x6c\x65\x22'
-    file_key = b'\x22\x04\x66\x69\x6c\x65\x22'
-    md5_key = b'\x63\x0c\x6d\x00\x64\x00\x35\x00\x73\x00\x75\x00\x6d\x00'
+    title_key    = b'\x22\x05title\x22'     # "\x05title"
+    file_key     = b'\x22\x04file\x22'       # "\x04file"
+    filetype_key = b'\x22\x08filetype\x22'  # "\x08filetype"  — new format per-item anchor
+    md5sum_key   = b'\x22\x06md5sum\x22\x20'  # "\x06md5sum" + space  — new format value prefix
 
-    if b"materialsA" not in blob_buf:
+    # Old format
+    if b"materialsA" in blob_buf:
+        md5_key = b'\x63\x0c\x6d\x00\x64\x00\x35\x00\x73\x00\x75\x00\x6d\x00'
+
+        def read_len_str(pos: int) -> tuple[str, int]:
+            length = 0
+            shift = 0
+            while pos < len(blob_buf):
+                byte = blob_buf[pos]
+                pos += 1
+                length |= (byte & 0x7F) << shift
+                shift += 7
+                if byte < 128:
+                    break
+            s = blob_buf[pos: pos + length].decode("latin-1")
+            return s, pos + length
+
+        materials = []
+        pos = blob_buf.find(b"materialsA")
+        while True:
+            pos = blob_buf.find(title_key, pos)
+            if pos == -1:
+                break
+            t_str, t_end = read_len_str(pos + len(title_key))
+            f_pos = blob_buf.find(file_key, t_end)
+            if f_pos == -1 or f_pos > t_end + 200:
+                pos = t_end
+                continue
+            f_str, f_end = read_len_str(f_pos + len(file_key))
+            ext = f_str.rsplit(".", 1)[-1] if "." in f_str else ""
+            md5sum = None
+            m_pos = blob_buf.find(md5_key, f_end)
+            if m_pos != -1 and m_pos < f_end + 4000:
+                hash_start = m_pos + len(md5_key) + 2
+                candidate = blob_buf[hash_start: hash_start + 32].decode("ascii", errors="replace")
+                if re.fullmatch(r"[0-9a-f]{32}", candidate):
+                    md5sum = candidate
+            materials.append({"title": t_str, "file": f_str, "ext": ext, "md5sum": md5sum})
+            pos = f_end
+        return materials
+
+    # New format: each item has "file" → "zipUrl" → "filetype" → "md5sum" sequence.
+    # "preview_md5sum" uses key length 0x0E, so md5sum_key (0x06) never matches it.
+    # Between "file" and "filetype" there may be large binary blobs (page images), so
+    # we anchor backwards via "zipUrl" (always ≤100 bytes before "filetype") and then
+    # search backwards from there for "file" and "title".
+    zipurl_key = b'\x22\x06zipUrl'  # "\x06zipUrl" — no value-type suffix (varies)
+    if filetype_key not in blob_buf:
         return []
 
-    def read_len_str(pos: int) -> tuple[str, int]:
-        length = 0
-        shift = 0
-        while pos < len(blob_buf):
-            byte = blob_buf[pos]
-            pos += 1
-            length |= (byte & 0x7F) << shift
-            shift += 7
-            if byte < 128:
-                break
-        s = blob_buf[pos: pos + length].decode("latin-1")
-        return s, pos + length
-
     materials = []
-    pos = blob_buf.find(b"materialsA")
-
+    pos = 0
     while True:
-        pos = blob_buf.find(title_key, pos)
+        pos = blob_buf.find(filetype_key, pos)
         if pos == -1:
             break
-        t_str, t_end = read_len_str(pos + len(title_key))
-        f_pos = blob_buf.find(file_key, t_end)
-        if f_pos == -1 or f_pos > t_end + 200:
-            pos = t_end
+
+        ft_len, ft_start = read_varint(blob_buf, pos + len(filetype_key))
+        if not (0 < ft_len <= 10):
+            pos += len(filetype_key)
             continue
-        f_str, f_end = read_len_str(f_pos + len(file_key))
-        ext = f_str.rsplit(".", 1)[-1] if "." in f_str else ""
+        ext = blob_buf[ft_start: ft_start + ft_len].decode("latin-1", errors="replace")
 
+        # Find "zipUrl" ≤100 bytes before "filetype" — it's the nearest anchor
+        near_before = blob_buf[max(0, pos - 100): pos]
+        zp = near_before.rfind(zipurl_key)
+        if zp == -1:
+            pos += len(filetype_key)
+            continue
+        # Absolute position of "zipUrl" in blob
+        zipurl_abs = max(0, pos - 100) + zp
+
+        # "file" and "title" appear ≤400 bytes before "zipUrl"
+        before = blob_buf[max(0, zipurl_abs - 400): zipurl_abs]
+
+        fp = before.rfind(file_key)
+        filename = None
+        if fp != -1:
+            f_len, f_start = read_varint(before, fp + len(file_key))
+            if 0 < f_len <= 150:
+                filename = re.sub(rb'[\x00-\x1f\x7f]', b'', before[f_start: f_start + f_len]).decode("latin-1", errors="replace")
+
+        if filename is None:
+            # FILE_KEY missing or varint too large (binary blob separates fields):
+            # scan backwards from zipUrl for a printable suffix (filename tail)
+            fname_bytes = []
+            for scan_pos in range(zipurl_abs - 1, max(0, zipurl_abs - 100), -1):
+                b = blob_buf[scan_pos]
+                if 0x20 <= b <= 0x7E:
+                    fname_bytes.insert(0, b)
+                else:
+                    break
+            filename = bytes(fname_bytes).decode("ascii", errors="replace").strip()
+
+        tp = before.rfind(title_key)
+        title = filename
+        if tp != -1:
+            t_len, t_start = read_varint(before, tp + len(title_key))
+            if 0 < t_len <= 200:
+                title = re.split(rb'[\x00-\x1f]', before[t_start: t_start + t_len])[0].decode("latin-1", errors="replace").strip()
+
+        # "md5sum" field follows "filetype" within the same entry
+        after = blob_buf[pos: pos + 600]
         md5sum = None
-        m_pos = blob_buf.find(md5_key, f_end)
-        if m_pos != -1 and m_pos < f_end + 4000:
-            hash_start = m_pos + len(md5_key) + 2
-            candidate = blob_buf[hash_start: hash_start + 32].decode("ascii", errors="replace")
-            if re.fullmatch(r"[0-9a-f]{32}", candidate):
-                md5sum = candidate
+        mp = after.find(md5sum_key)
+        if mp != -1:
+            candidate = after[mp + len(md5sum_key): mp + len(md5sum_key) + 32]
+            if re.fullmatch(rb'[0-9a-f]{32}', candidate):
+                md5sum = candidate.decode("ascii")
 
-        materials.append({"title": t_str, "file": f_str, "ext": ext, "md5sum": md5sum})
-        pos = f_end
+        materials.append({"title": title, "file": filename, "ext": ext, "md5sum": md5sum})
+        pos += len(filetype_key)
 
     return materials
 
@@ -610,6 +849,7 @@ def find_unicode_font() -> str | None:
 def main():
     args = sys.argv[1:]
     force = "--force" in args
+    half_res = "--half-res" in args
     no_text = "--no-text" in args
     markdown = "--markdown" in args
     debug_text = "--debug-text" in args
@@ -665,8 +905,17 @@ def main():
         else:
             print("  Warnung: Kein Unicode-Font gefunden. Einige Zeichen könnten fehlen.", flush=True)
 
-    # Extract book titles
-    book_titles = extract_book_titles(ldb_dir)
+    # Extract book titles and persist cache
+    book_titles = extract_book_titles(ldb_dir, output_dir)
+    try:
+        import json
+        titles_cache = output_dir / "titles.json"
+        titles_cache.write_text(
+            json.dumps({str(k): v for k, v in book_titles.items()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     print("\nGefundene Bücher:", flush=True)
     for blob_path in blob_files:
@@ -681,7 +930,7 @@ def main():
 
         book_title = book_titles.get(book_id)
         book_label = f"{book_title} ({book_id})" if book_title else f"Book {book_id}"
-        pages = extract_page_mapping(blob_path)
+        pages = extract_page_mapping(blob_path, ldb_dir, book_id)
 
         if not pages:
             print(f"\n{book_label}: keine Seiten gefunden, überspringe.", flush=True)
@@ -694,13 +943,67 @@ def main():
             print("  Keine lokalen Dateien, überspringe.", flush=True)
             continue
 
+        # Split into main book (image) pages and solution (PDF) pages.
+        # BiBox stores solution pages twice: as low-res JPEG previews AND full-quality PDFs.
+        # Detect the contiguous JPEG block immediately before the PDF block → skip those as previews.
+        def _quick_fmt(h: str) -> str:
+            try:
+                raw4 = hash_to_file_path(sync_dir, h).read_bytes()[:4]
+                dec4 = decrypt(raw4)
+                if dec4[:4] == b"%PDF":
+                    return "pdf"
+                if dec4[:2] == b"\xff\xd8":
+                    return "jpg"
+                if dec4[:2] == b"\x89\x50":
+                    return "png"
+            except Exception:
+                pass
+            return "other"
+
+        fmts = [_quick_fmt(p["hash"]) for p in existing]
+        first_pdf_idx = next((i for i, f in enumerate(fmts) if f == "pdf"), None)
+
+        sol_pages: list[dict] = []
+        if first_pdf_idx is not None:
+            sol_pages = existing[first_pdf_idx:]
+            # Find contiguous JPEG block immediately before PDF block = low-res previews.
+            # Skip any non-jpg/non-pdf material (e.g. ZIP files) that may sit between the
+            # JPEG previews and the solution PDFs, then count the trailing JPEG run.
+            # Cap by number of solution PDFs (one preview per file).
+            j = first_pdf_idx - 1
+            while j >= 0 and fmts[j] not in ("jpg", "pdf"):
+                j -= 1
+            k = j
+            while k >= 0 and fmts[k] == "jpg":
+                k -= 1
+            preview_count = min(j - k, len(sol_pages))
+            preview_start = j + 1 - preview_count
+            if preview_count:
+                print(f"  {preview_count} Vorschau-Seiten übersprungen (als PDF verfügbar)", flush=True)
+            existing = existing[:preview_start]  # main book pages only
+
+        # Trim supplementary material images (screenshots, GeoGebra etc.) that appear
+        # after the main book pages but before the solution previews/ZIPs/PDFs.
+        # Heuristic: main book = initial contiguous block with the same format.
+        # Only applies when the book starts with PNG (scanned pages), since PNG→JPG
+        # transitions reliably mark the boundary between book pages and supplements.
+        if existing and fmts[0] == "png":
+            main_end = next(
+                (i for i in range(len(existing)) if fmts[i] != "png"),
+                len(existing),
+            )
+            if 0 < main_end < len(existing):
+                print(f"  {len(existing) - main_end} Zusatzmaterial-Seiten übersprungen", flush=True)
+                existing = existing[:main_end]
+
         # Match pageData by page count
         page_data_map = None
         sorted_page_ids = None
         if all_page_data:
-            best = min(all_page_data, key=lambda pd: abs(len(pd) - len(pages)))
+            max_blob_page = max(p["page"] for p in pages) if pages else 0
+            best = min(all_page_data, key=lambda pd: abs(len(pd) - max_blob_page))
             sorted_ids = sorted(int(k) for k in best.keys())
-            if abs(len(sorted_ids) - len(pages)) <= len(pages) * 0.2:
+            if len(sorted_ids) >= max_blob_page:
                 page_data_map = best
                 sorted_page_ids = sorted_ids
 
@@ -734,10 +1037,8 @@ def main():
         overlay_color = (1, 0, 0) if debug_text else (0, 0, 0)
         overlay_opacity = 0.5 if debug_text else 0
 
-        for p in pages:
+        for p in existing:
             file_path = hash_to_file_path(sync_dir, p["hash"])
-            if not file_path.exists():
-                continue
 
             encrypted = file_path.read_bytes()
             decrypted = decrypt(encrypted)
@@ -747,6 +1048,8 @@ def main():
                 ext = "jpg"
             elif decrypted[:2] == b"\x89\x50":
                 ext = "png"
+            elif decrypted[:4] == b"%PDF":
+                ext = "pdf"
             else:
                 continue
 
@@ -757,13 +1060,24 @@ def main():
                 (img_dir / f"page-{p['page']:04d}.{ext}").write_bytes(decrypted)
 
             try:
-                # Create page from image
-                img = fitz.open(stream=decrypted, filetype=ext)
-                img_page = img[0]
-                rect = img_page.rect
-                pdf_page = pdf_doc.new_page(width=rect.width, height=rect.height)
-                pdf_page.insert_image(rect, stream=decrypted)
-                img.close()
+                # Create page from image, scaled to correct physical size.
+                # Read pixel dims from header (not img_page.rect — PyMuPDF scales that internally).
+                pixel_w, pixel_h = _pixel_dims(decrypted, ext)
+                dpi = _image_dpi(decrypted, ext) or 300.0
+                if half_res and ext in ("png", "jpg"):
+                    pix = fitz.Pixmap(decrypted)
+                    if pix.alpha:  # JPEG doesn't support transparency — drop alpha channel
+                        pix = fitz.Pixmap(pix, 0)
+                    pix.shrink(1)  # halves both dimensions in-place
+                    decrypted = pix.tobytes("jpeg", jpg_quality=85)
+                    ext = "jpg"
+                    pixel_w, pixel_h = pix.width, pix.height
+                    dpi /= 2  # same physical page size, half the stored resolution
+                scale = 72.0 / dpi
+                page_w = pixel_w * scale
+                page_h = pixel_h * scale
+                pdf_page = pdf_doc.new_page(width=page_w, height=page_h)
+                pdf_page.insert_image(pdf_page.rect, stream=decrypted)
 
                 # Add text overlay (one TextWriter per page, font reused)
                 if overlay_font and sorted_page_ids and 1 <= p["page"] <= len(sorted_page_ids):
@@ -774,10 +1088,10 @@ def main():
                         tw = fitz.TextWriter(pdf_page.rect)
                         appended = 0
                         for w in words:
-                            x = (w["x"] / 100) * rect.width
-                            y = (w["y"] / 100) * rect.height
-                            target_w = (w["w"] / 100) * rect.width
-                            target_h = (w["h"] / 100) * rect.height
+                            x = (w["x"] / 100) * page_w
+                            y = (w["y"] / 100) * page_h
+                            target_w = (w["w"] / 100) * page_w
+                            target_h = (w["h"] / 100) * page_h
 
                             # Calculate font size from target width (like JS version)
                             width_at_1 = overlay_font.text_length(w["text"], fontsize=1)
@@ -808,6 +1122,33 @@ def main():
         size_mb = pdf_path.stat().st_size / 1024 / 1024
         pdf_doc.close()
         print(f" {count} Seiten, {size_mb:.1f} MB -> {pdf_path}", flush=True)
+
+        # Solutions PDF (separate file for full-quality PDF pages)
+        if sol_pages:
+            sol_path = book_dir / f"{base_name} - Lösungen.pdf"
+            print(f"  Lösungen als separate PDF...", flush=True)
+            sol_doc = fitz.open()
+            sol_count = 0
+            for sp in sol_pages:
+                try:
+                    enc = hash_to_file_path(sync_dir, sp["hash"]).read_bytes()
+                    dec = decrypt(enc)
+                    if dec[:4] != b"%PDF":
+                        continue
+                    sub = fitz.open(stream=dec, filetype="pdf")
+                    n = sub.page_count
+                    for sub_page in sub:
+                        rect = sub_page.rect
+                        sol_page = sol_doc.new_page(width=rect.width, height=rect.height)
+                        sol_page.show_pdf_page(rect, sub, sub_page.number)
+                    sub.close()
+                    sol_count += n
+                except Exception as e:
+                    print(f"  Lösung {sp['page']}: Fehler: {e}", flush=True)
+            sol_doc.save(str(sol_path), garbage=4, deflate=True)
+            sol_size_mb = sol_path.stat().st_size / 1024 / 1024
+            sol_doc.close()
+            print(f"  -> {sol_count} Seiten, {sol_size_mb:.1f} MB -> {sol_path}", flush=True)
 
         # Export text
         if sorted_page_ids and page_data_map:
